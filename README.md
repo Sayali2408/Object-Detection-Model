@@ -7,4 +7,4 @@ https://pjreddie.com/media/files/yolov3.weights
 https://drive.google.com/file/d/1W_moLzMlGiELyPxWiYQJ9KFaXroQ_NFQ/view
 
 Then run the .py file for successful implementation
-yoloObjectDetectionFromImagesCPU.py
+#yoloObjectDetectionFromImagesCPU.py
