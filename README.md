@@ -8,3 +8,6 @@ https://drive.google.com/file/d/1W_moLzMlGiELyPxWiYQJ9KFaXroQ_NFQ/view
 
 ## Then run the .py file for successful implementation
 yoloObjectDetectionFromImagesCPU.py
+
+## For detailed setup and installation refere to below file
+File and setup info.docx
