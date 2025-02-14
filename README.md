@@ -1,6 +1,6 @@
 ## Object Detection Model
 
-## To train the YOLO model download the below dataset file
+## To train the YOLO model with dataset download the below file
 https://pjreddie.com/media/files/yolov3.weights
 
 ## Download the below file for gender framework
