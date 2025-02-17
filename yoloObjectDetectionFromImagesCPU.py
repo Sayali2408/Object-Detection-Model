@@ -1,18 +1,27 @@
 import cv2
 import numpy as np
 import mediapipe as mp
+from deepface import DeepFace
+import os
+import sys
 
-# Add these constants at the top of the file
-GENDER_MODEL = 'Object detection\gender_net.caffemodel'
-GENDER_PROTO = 'Object detection\gender_deploy.prototxt'
+# constants of the file
+GENDER_MODEL = 'gender_net.caffemodel'
+GENDER_PROTO = 'gender_deploy.prototxt'
 GENDER_LIST = ['Male', 'Female']
 MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
 GENDER_CONFIDENCE_THRESHOLD = 0.8
+AGE_MODEL = 'age_net.caffemodel'
+AGE_PROTO = 'age_deploy.prototxt'
+AGE_RANGES = ['(0-2)', '(3-7)', '(8-12)', '(13-17)', '(18-24)', '(25-32)', '(33-40)', '(41-50)', '(51-60)', '(61-70)', '(71-80)', '(81-90)', '(91-100)']
 
 # ------------------------ Object Detection (YOLO) ------------------------
 class YOLOObjectDetector:
-    def __init__(self, weights_path="Object detection\yolov3.weights", config_path="Object detection\yolov3.cfg", names_path="Object detection\coco.names"):
+    def __init__(self, weights_path="yolov3.weights", config_path="yolov3.cfg", names_path="coco.names"):
         self.yolo = cv2.dnn.readNet(weights_path, config_path)
+        # Enable OpenCV DNN optimization
+        self.yolo.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        self.yolo.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         with open(names_path, "r") as file:
             self.classes = [line.strip() for line in file.readlines()]
         layer_names = self.yolo.getLayerNames()
@@ -25,45 +34,59 @@ class YOLOObjectDetector:
         self.gender_classifier = classifier
     
     def detect_objects(self, frame):
-        height, width, _ = frame.shape
-        blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+        # Resize frame for faster processing while maintaining aspect ratio
+        scale = 0.5
+        height, width = frame.shape[:2]
+        new_height, new_width = int(height * scale), int(width * scale)
+        resized_frame = cv2.resize(frame, (new_width, new_height))
+        
+        # Create blob with optimized parameters
+        blob = cv2.dnn.blobFromImage(resized_frame, 1/255.0, (416, 416), swapRB=True, crop=False)
         self.yolo.setInput(blob)
         outputs = self.yolo.forward(self.output_layers)
         
         class_ids, confidences, boxes = [], [], []
+        # Increased confidence threshold for better performance
+        conf_threshold = 0.6
+        nms_threshold = 0.3
+        
         for output in outputs:
             for detection in output:
                 scores = detection[5:]
                 class_id = np.argmax(scores)
                 confidence = scores[class_id]
-                if confidence > 0.5:
-                    center_x, center_y, w, h = (
-                        int(detection[0] * width), int(detection[1] * height),
-                        int(detection[2] * width), int(detection[3] * height)
-                    )
-                    x, y = int(center_x - w / 2), int(center_y - h / 2)
+                if confidence > conf_threshold:
+                    # Scale back to original size
+                    center_x = int(detection[0] * new_width / scale)
+                    center_y = int(detection[1] * new_height / scale)
+                    w = int(detection[2] * new_width / scale)
+                    h = int(detection[3] * new_height / scale)
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
                     boxes.append([x, y, w, h])
                     confidences.append(float(confidence))
                     class_ids.append(class_id)
         
-        indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
-        for i in range(len(boxes)):
-            if i in indexes:
-                x, y, w, h = boxes[i]
-                label = str(self.classes[class_ids[i]])
-                
-                # If it's a person, try to detect gender
-                if label == "person" and self.gender_classifier and self.gender_classifier.model_loaded:
-                    face_img = frame[max(0, y):min(y+h, height), max(0, x):min(x+w, width)].copy()
-                    if face_img.size > 0:
-                        try:
-                            gender = self.gender_classifier.predict_gender(face_img)
-                            label = f"person ({gender})"
-                        except Exception:
-                            pass
-                
-                cv2.rectangle(frame, (x, y), (x + w, y + h), self.colorGreen, 3)
-                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_PLAIN, 2, self.colorRed, 2)
+        indexes = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, nms_threshold)
+        
+        # Batch process detections
+        valid_detections = [(i, boxes[i], class_ids[i]) for i in indexes.flatten()]
+        for i, box, class_id in valid_detections:
+            x, y, w, h = box
+            label = str(self.classes[class_id])
+            
+            # Process person detection only if confidence is very high
+            if label == "person" and self.gender_classifier and self.gender_classifier.model_loaded and confidences[i] > 0.7:
+                face_img = frame[max(0, y):min(y+h, height), max(0, x):min(x+w, width)].copy()
+                if face_img.size > 0:
+                    try:
+                        gender = self.gender_classifier.predict_gender(face_img)
+                        label = f"person ({gender})"
+                    except Exception:
+                        pass
+            
+            cv2.rectangle(frame, (x, y), (x + w, y + h), self.colorGreen, 2)
+            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_PLAIN, 1.5, self.colorRed, 2)
 
 # ------------------------ Hand Gesture Recognition (MediaPipe) ------------------------
 class HandGestureRecognizer:
@@ -72,21 +95,28 @@ class HandGestureRecognizer:
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
-            min_detection_confidence=0.7,  # Increased confidence threshold
-            min_tracking_confidence=0.7
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
         )
         self.mp_draw = mp.solutions.drawing_utils
     
     def detect_hand_gestures(self, frame):
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Resize frame for faster processing
+        scale = 0.5
+        small_frame = cv2.resize(frame, None, fx=scale, fy=scale)
+        rgb_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb_frame)
-        height, width, _ = frame.shape
+        height, width = frame.shape[:2]
         
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
-                self.mp_draw.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-                gesture = self.identify_gesture(hand_landmarks)
-                wrist = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
+                # Scale landmarks back to original size
+                scaled_landmarks = mp.solutions.hands.HandLandmark(
+                    [landmark * (1/scale) for landmark in hand_landmarks.landmark]
+                )
+                self.mp_draw.draw_landmarks(frame, scaled_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                gesture = self.identify_gesture(scaled_landmarks)
+                wrist = scaled_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
                 gesture_x, gesture_y = int(wrist.x * width), int(wrist.y * height)
                 cv2.putText(frame, gesture, (gesture_x, gesture_y - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
@@ -307,32 +337,339 @@ class GenderClassifier:
                 print(f"Error processing face: {e}")
                 continue
 
+# ------------------------ Emotion Detection (DeepFace) ------------------------
+class EmotionDetector:
+    def __init__(self):
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    
+    def detect_emotions(self, frame):
+        try:
+            # Convert frame to grayscale
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Detect faces in the frame
+            faces = self.face_cascade.detectMultiScale(
+                gray_frame, 
+                scaleFactor=1.1, 
+                minNeighbors=5, 
+                minSize=(60, 60)
+            )
+            
+            for (x, y, w, h) in faces:
+                try:
+                    # Extract face ROI
+                    face_roi = frame[y:y+h, x:x+w]
+                    
+                    # Analyze emotion using DeepFace
+                    result = DeepFace.analyze(
+                        face_roi, 
+                        actions=['emotion'], 
+                        enforce_detection=False,
+                        silent=True
+                    )
+                    
+                    # Get dominant emotion
+                    emotion = result[0]['dominant_emotion']
+                    
+                    # Draw emotion label
+                    cv2.putText(frame, 
+                              f"Emotion: {emotion}", 
+                              (x, y + h + 20),  # Position below face
+                              cv2.FONT_HERSHEY_SIMPLEX, 
+                              0.8, 
+                              (0, 0, 255),  # Red color
+                              2)
+                except Exception as e:
+                    print(f"Error analyzing emotion: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"Error in emotion detection: {e}")
+
+# ------------------------ Age Detection ------------------------
+class AgeDetector:
+    def __init__(self):
+        try:
+            self.age_net = cv2.dnn.readNetFromCaffe(AGE_PROTO, AGE_MODEL)
+            self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            self.model_loaded = True
+            # Minimum confidence threshold for age predictions
+            self.confidence_threshold = 0.6
+        except cv2.error as e:
+            print(f"\nError loading age detection model: {e}")
+            self.model_loaded = False
+
+    def assess_face_quality(self, face_img):
+        """Assess the quality of the face image"""
+        if face_img is None or face_img.size == 0:
+            return False
+            
+        # Check minimum face size
+        if face_img.shape[0] < 60 or face_img.shape[1] < 60:
+            return False
+            
+        # Calculate image sharpness
+        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if laplacian_var < 100:  # Threshold for blur detection
+            return False
+            
+        # Check brightness
+        brightness = np.mean(gray)
+        if brightness < 40 or brightness > 250:  # Too dark or too bright
+            return False
+            
+        return True
+
+    def preprocess_face(self, face_img):
+        """Enhanced preprocessing for face image"""
+        if face_img.shape[0] == 0 or face_img.shape[1] == 0:
+            return None
+            
+        try:
+            # Convert to grayscale and apply histogram equalization
+            gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+            equalized = cv2.equalizeHist(gray)
+            enhanced = cv2.cvtColor(equalized, cv2.COLOR_GRAY2BGR)
+            
+            # Apply slight Gaussian blur to reduce noise
+            enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+            
+            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+            lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            lab[:,:,0] = clahe.apply(lab[:,:,0])
+            enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            
+            # Create blob for the model
+            blob = cv2.dnn.blobFromImage(
+                enhanced, 
+                1.0, 
+                (227, 227),
+                MODEL_MEAN_VALUES, 
+                swapRB=False
+            )
+            return blob
+        except Exception as e:
+            print(f"Error in face preprocessing: {e}")
+            return None
+
+    def predict_age(self, face_img):
+        """Enhanced age prediction using ensemble approach"""
+        if face_img is None or face_img.size == 0:
+            return None
+            
+        if not self.assess_face_quality(face_img):
+            return None
+            
+        try:
+            # Get prediction from Caffe model
+            blob = self.preprocess_face(face_img)
+            if blob is None:
+                return None
+                
+            self.age_net.setInput(blob)
+            age_preds = self.age_net.forward()
+            confidence = np.max(age_preds[0])
+            
+            if confidence < self.confidence_threshold:
+                return None
+                
+            age_idx = age_preds[0].argmax()
+            caffe_age = AGE_RANGES[age_idx]
+            
+            # Get prediction from DeepFace
+            try:
+                deepface_result = DeepFace.analyze(
+                    face_img, 
+                    actions=['age'],
+                    enforce_detection=False,
+                    silent=True
+                )
+                deepface_age = deepface_result[0]['age']
+                
+                # Combine predictions
+                caffe_age_range = caffe_age.strip('()').split('-')
+                caffe_avg = (int(caffe_age_range[0]) + int(caffe_age_range[1])) / 2
+                
+                # Weighted average based on confidence
+                final_age = int((caffe_avg + deepface_age) / 2)
+                
+                # Find the closest age range
+                for age_range in AGE_RANGES:
+                    range_nums = age_range.strip('()').split('-')
+                    range_avg = (int(range_nums[0]) + int(range_nums[1])) / 2
+                    if abs(range_avg - final_age) <= 5:
+                        return age_range
+                
+                return caffe_age  # Fallback to Caffe prediction
+                
+            except Exception as e:
+                print(f"DeepFace error: {e}")
+                return caffe_age  # Fallback to Caffe prediction
+                
+        except Exception as e:
+            print(f"Error predicting age: {str(e)}")
+            return None
+
+    def detect_age(self, frame):
+        """Enhanced age detection in frame"""
+        if not self.model_loaded:
+            return
+            
+        try:
+            # Convert to grayscale for face detection
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Enhanced face detection parameters
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.05,  # More precise scaling
+                minNeighbors=6,    # Stricter detection
+                minSize=(60, 60),  # Minimum face size
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            
+            # Process each face
+            for (x, y, w, h) in faces:
+                try:
+                    # Add padding to include more context
+                    padding = int(0.1 * w)  # 10% padding
+                    x1 = max(0, x - padding)
+                    y1 = max(0, y - padding)
+                    x2 = min(frame.shape[1], x + w + padding)
+                    y2 = min(frame.shape[0], y + h + padding)
+                    
+                    # Extract and preprocess face
+                    face_roi = frame[y1:y2, x1:x2]
+                    if face_roi.size == 0:
+                        continue
+                        
+                    # Predict age
+                    age_label = self.predict_age(face_roi)
+                    
+                    if age_label:
+                        # Draw age label with better visibility
+                        label_background = (0, 0, 0)
+                        label_color = (255, 255, 255)
+                        label_text = f"Age: {age_label}"
+                        
+                        # Get text size for background rectangle
+                        (text_width, text_height), baseline = cv2.getTextSize(
+                            label_text,
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            2
+                        )
+                        
+                        # Draw background rectangle
+                        cv2.rectangle(
+                            frame,
+                            (x1, y1 - text_height - 10),
+                            (x1 + text_width + 10, y1),
+                            label_background,
+                            -1
+                        )
+                        
+                        # Draw text
+                        cv2.putText(
+                            frame,
+                            label_text,
+                            (x1 + 5, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            label_color,
+                            2
+                        )
+                        
+                except Exception as e:
+                    print(f"Error processing face for age: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"Error in age detection: {e}")
+
+# Add error handling for missing model files
+def check_required_files():
+    required_files = {
+        'YOLO': ['yolov3.weights', 'yolov3.cfg', 'coco.names'],
+        'Gender': ['gender_net.caffemodel', 'gender_deploy.prototxt'],
+        'Age': ['age_net.caffemodel', 'age_deploy.prototxt']
+    }
+    
+    missing_files = []
+    for category, files in required_files.items():
+        for file in files:
+            if not os.path.exists(file):
+                missing_files.append(f"{category}: {file}")
+    
+    if missing_files:
+        print("\nMissing required files:")
+        for file in missing_files:
+            print(f"- {file}")
+        print("\nPlease ensure all model files are in the project directory.")
+        return False
+    return True
+
 # ------------------------ Main Application ------------------------
 if __name__ == "__main__":
     try:
+        # Check required files before starting
+        if not check_required_files():
+            sys.exit(1)
+            
         cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            raise Exception("Could not open video capture device")
+            
+        # Initialize detectors with better error handling
         gender_classifier = GenderClassifier()
         yolo_detector = YOLOObjectDetector()
         hand_recognizer = HandGestureRecognizer()
+        emotion_detector = EmotionDetector()
+        age_detector = AgeDetector()
         
         # Connect gender classifier to YOLO detector
         yolo_detector.set_gender_classifier(gender_classifier)
         
+        print("\nStarting detection system...")
+        print("Press 'q' to quit")
+        
         while True:
             ret, frame = cap.read()
             if not ret:
+                print("Error: Could not read frame")
                 break
             
-            # Run all detections
-            yolo_detector.detect_objects(frame)
-            hand_recognizer.detect_hand_gestures(frame)
-            
-            cv2.imshow("Object Detection, Hand Gesture, and Gender Recognition", frame)
+            # Run all detections with try-except blocks
+            try:
+                yolo_detector.detect_objects(frame)
+                hand_recognizer.detect_hand_gestures(frame)
+                emotion_detector.detect_emotions(frame)
+                age_detector.detect_age(frame)
+                
+                # Add FPS counter
+                cv2.putText(frame, 
+                           f"Press 'q' to quit", 
+                           (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 
+                           0.7, 
+                           (0, 255, 255), 
+                           2)
+                
+                cv2.imshow("Multi-Modal Detection System", frame)
+                
+            except Exception as e:
+                print(f"Error processing frame: {e}")
+                continue
+                
             if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("\nStopping detection system...")
                 break
     
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"\nAn error occurred: {e}")
     finally:
+        print("\nCleaning up...")
         cap.release()
         cv2.destroyAllWindows()
