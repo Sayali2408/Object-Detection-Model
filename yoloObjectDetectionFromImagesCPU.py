@@ -13,7 +13,7 @@ MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
 GENDER_CONFIDENCE_THRESHOLD = 0.8
 AGE_MODEL = 'age_net.caffemodel'
 AGE_PROTO = 'age_deploy.prototxt'
-AGE_RANGES = ['(0-2)', '(3-7)', '(8-12)', '(13-17)', '(18-24)', '(25-32)', '(33-40)', '(41-50)', '(51-60)', '(61-70)', '(71-80)', '(81-90)', '(91-100)']
+AGE_RANGES = [(0, 2), (3, 7), (8, 12), (13, 17), (18, 24), (25, 32), (33, 40), (41, 50), (51, 60), (61, 70), (71, 80), (81, 90), (91, 100)]
 
 # ------------------------ Object Detection (YOLO) ------------------------
 class YOLOObjectDetector:
@@ -291,33 +291,15 @@ class GenderClassifier:
 class EmotionDetector:
     def __init__(self):
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        # Add prediction cache
+        # Initialize DeepFace with optimized settings
+        self.emotion_threshold = 0.4
+        # Cache to store recent predictions
         self.prediction_cache = {}
         self.cache_ttl = 15  # Cache predictions for 15 frames
         self.frame_count = 0
-        # Initialize DeepFace with optimized settings
-        self.emotion_threshold = 0.4
-
-    def preprocess_face(self, face_img):
-        """Enhanced preprocessing for emotion detection"""
-        if face_img.size == 0:
-            return None
-            
-        # Resize to optimal size
-        face_img = cv2.resize(face_img, (48, 48))
-        
-        # Apply CLAHE
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        lab = cv2.cvtColor(face_img, cv2.COLOR_BGR2LAB)
-        lab_planes = list(cv2.split(lab))
-        lab_planes[0] = clahe.apply(lab_planes[0])
-        lab = cv2.merge(lab_planes)
-        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-        
-        return enhanced
 
     def detect_emotions(self, frame):
-        """Optimized emotion detection with batch processing and caching"""
+        """Detect emotions in frame with error handling and caching"""
         if frame is None or frame.size == 0:
             return frame
 
@@ -330,14 +312,17 @@ class EmotionDetector:
             minSize=(30, 30)
         )
 
-        # Process faces in batch
         for (x, y, w, h) in faces:
-            face_img = frame[y:y+h, x:x+w].copy()
-            
-            # Get face encoding for caching
             try:
-                face_encoding = cv2.resize(face_img, (64, 64)).flatten()
-                cache_key = str(face_encoding)
+                # Extract face ROI
+                face_img = frame[y:y+h, x:x+w].copy()
+                
+                # Skip if face is too small
+                if face_img.shape[0] < 64 or face_img.shape[1] < 64:
+                    continue
+
+                # Generate cache key from face position and size
+                cache_key = f"{x}_{y}_{w}_{h}"
                 
                 # Check cache
                 if cache_key in self.prediction_cache:
@@ -350,49 +335,53 @@ class EmotionDetector:
                         emotion, confidence = self._predict_emotion(face_img)
                 else:
                     emotion, confidence = self._predict_emotion(face_img)
-                
-                # Cache new prediction
-                self.prediction_cache[cache_key] = {
-                    'emotion': emotion,
-                    'confidence': confidence,
-                    'frame_count': self.frame_count
-                }
-                
-            except Exception:
-                emotion, confidence = self._predict_emotion(face_img)
 
-            # Draw results if confidence is high enough
-            if confidence > self.emotion_threshold:
-                color = (0, 255, 0)
-                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-                cv2.putText(frame, f"{emotion} ({confidence:.2f})",
-                           (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                # Cache prediction
+                if confidence > self.emotion_threshold:
+                    self.prediction_cache[cache_key] = {
+                        'emotion': emotion,
+                        'confidence': confidence,
+                        'frame_count': self.frame_count
+                    }
+
+                    # Draw emotion label above the face
+                    label = f"Emotion: {emotion} ({confidence:.2f})"
+                    cv2.putText(frame, label,
+                              (x, y-10), cv2.FONT_HERSHEY_SIMPLEX,
+                              0.6, (255, 255, 0), 2)  # Yellow color
+
+            except Exception as e:
+                print(f"Error processing face for emotion: {str(e)}")
+                continue
 
         return frame
 
     def _predict_emotion(self, face_img):
-        """Internal method for emotion prediction"""
+        """Predict emotion with enhanced error handling"""
         try:
-            # Preprocess face
-            processed_face = self.preprocess_face(face_img)
-            if processed_face is None:
-                return "Unknown", 0.0
-
-            # Use DeepFace for emotion prediction
+            # Ensure minimum size for DeepFace
+            face_img = cv2.resize(face_img, (48, 48))
+            
+            # Use DeepFace for emotion prediction with optimized settings
             result = DeepFace.analyze(
-                processed_face,
+                face_img,
                 actions=['emotion'],
                 enforce_detection=False,
+                detector_backend='opencv',
                 silent=True
             )
             
+            if isinstance(result, list):
+                result = result[0]  # Get first result if multiple faces detected
+            
             if result and 'emotion' in result:
-                # Get the emotion with highest confidence
-                emotion = max(result['emotion'].items(), key=lambda x: x[1])
-                return emotion[0], emotion[1] / 100.0
+                emotions = result['emotion']
+                # Get emotion with highest confidence
+                emotion = max(emotions.items(), key=lambda x: x[1])
+                return emotion[0].capitalize(), emotion[1] / 100.0
                 
         except Exception as e:
-            print(f"Error in emotion prediction: {str(e)}")
+            print(f"DeepFace emotion prediction error: {str(e)}")
         
         return "Unknown", 0.0
 
@@ -403,49 +392,105 @@ class AgeDetector:
             self.age_net = cv2.dnn.readNetFromCaffe(AGE_PROTO, AGE_MODEL)
             self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
             self.model_loaded = True
-            # Average ages for each range
-            self.age_averages = [
-                1,    # (0-2)
-                5,    # (4-6)
-                10,   # (8-12)
-                17,   # (15-20)
-                23,   # (20-25)
-                28,   # (25-32)
-                40,   # (38-43)
-                50,   # (48-53)
-                65,   # (60-70)
-                75,   # (70-80)
-                85    # (80+)
+            
+            # More granular age ranges and their midpoints
+            self.age_ranges = [
+                (0, 2),    # Babies
+                (3, 7),    # Young children
+                (8, 12),   # Children
+                (13, 17),  # Teenagers
+                (18, 24),  # Young adults
+                (25, 32),  # Adults
+                (33, 40),  # Middle-aged
+                (41, 50),  # Middle-aged
+                (51, 60),  # Mature adults
+                (61, 70),  # Seniors
+                (71, 80),  # Elderly
+                (81, 90),  # Elderly
+                (91, 100)  # Elderly
             ]
+            
+            # Initialize moving average for age predictions
+            self.age_history = {}
+            self.history_size = 5
+            self.min_confidence = 0.6
+            
         except cv2.error as e:
             print(f"\nError loading age detection model: {e}")
             self.model_loaded = False
 
     def preprocess_face(self, face_img):
-        """Enhanced preprocessing for age detection"""
+        """Enhanced preprocessing for better age detection"""
         if face_img.shape[0] == 0 or face_img.shape[1] == 0:
             return None
             
-        # Enhance contrast to better detect wrinkles and age-related features
-        lab = cv2.cvtColor(face_img, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        cl = clahe.apply(l)
-        enhanced = cv2.merge((cl,a,b))
-        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+        try:
+            # Convert to grayscale
+            gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+            
+            # Apply histogram equalization
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(gray)
+            
+            # Apply slight Gaussian blur to reduce noise
+            enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+            
+            # Convert back to BGR
+            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+            
+            # Resize to model input size
+            enhanced = cv2.resize(enhanced, (227, 227))
+            
+            # Create blob with enhanced preprocessing
+            blob = cv2.dnn.blobFromImage(
+                enhanced, 
+                1.0, 
+                (227, 227),
+                MODEL_MEAN_VALUES,
+                swapRB=False
+            )
+            return blob
+            
+        except Exception as e:
+            print(f"Error in preprocessing: {e}")
+            return None
+
+    def smooth_age_prediction(self, face_id, age, confidence):
+        """Apply moving average to age predictions"""
+        if confidence < self.min_confidence:
+            return age, confidence
+            
+        if face_id not in self.age_history:
+            self.age_history[face_id] = []
+            
+        self.age_history[face_id].append((age, confidence))
         
-        # Create blob with enhanced image
-        blob = cv2.dnn.blobFromImage(
-            enhanced, 
-            1.0, 
-            (227, 227),
-            MODEL_MEAN_VALUES,
-            swapRB=False
-        )
-        return blob
+        # Keep only recent predictions
+        if len(self.age_history[face_id]) > self.history_size:
+            self.age_history[face_id].pop(0)
+            
+        # Calculate weighted average based on confidence
+        total_weight = 0
+        weighted_age = 0
+        
+        for hist_age, hist_conf in self.age_history[face_id]:
+            weighted_age += hist_age * hist_conf
+            total_weight += hist_conf
+            
+        smoothed_age = int(round(weighted_age / total_weight))
+        avg_confidence = total_weight / len(self.age_history[face_id])
+        
+        return smoothed_age, avg_confidence
+
+    def get_age_range(self, age):
+        """Get appropriate age range text"""
+        for i, (min_age, max_age) in enumerate(self.age_ranges):
+            if min_age <= age <= max_age:
+                return f"{min_age}-{max_age}"
+        return "Unknown"
 
     def predict_age(self, face_img):
-        """Predict age from face image with confidence"""
+        """Predict age with improved accuracy"""
         if face_img is None or face_img.size == 0:
             return None, 0
             
@@ -459,8 +504,11 @@ class AgeDetector:
             
             # Get prediction and confidence
             age_idx = pred[0].argmax()
-            predicted_age = self.age_averages[age_idx]
-            confidence = pred[0][age_idx] * 100
+            confidence = float(pred[0][age_idx])
+            
+            # Get age range
+            min_age, max_age = self.age_ranges[age_idx]
+            predicted_age = (min_age + max_age) // 2
             
             return predicted_age, confidence
             
@@ -469,7 +517,7 @@ class AgeDetector:
             return None, 0
 
     def detect_age(self, frame):
-        """Detect age in frame with enhanced visualization"""
+        """Detect age with improved visualization"""
         if not self.model_loaded:
             return
             
@@ -493,22 +541,28 @@ class AgeDetector:
                     if face_roi.size == 0:
                         continue
                         
+                    # Generate face ID for tracking
+                    face_id = f"{x}_{y}_{w}_{h}"
+                    
                     # Predict age with confidence
                     age, confidence = self.predict_age(face_roi)
                     
                     if age is not None:
-                        # Draw rectangle around face
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                        # Apply smoothing
+                        smoothed_age, avg_confidence = self.smooth_age_prediction(face_id, age, confidence)
                         
-                        # Draw age label with confidence
-                        label = f'Age: {age} years ({confidence:.1f}%)'
+                        # Get age range
+                        age_range = self.get_age_range(smoothed_age)
+                        
+                        # Draw age label below the face
+                        label = f'Age: {smoothed_age} ({age_range}) ({avg_confidence:.2f})'
                         cv2.putText(
                             frame,
                             label,
-                            (x, y - 10),
+                            (x, y + h + 25),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8,
-                            (0, 255, 0),
+                            0.6,
+                            (255, 0, 255),  # Magenta color
                             2
                         )
                 except Exception as e:
